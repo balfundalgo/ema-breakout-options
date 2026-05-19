@@ -7,4 +7,3 @@ dist/
 *.egg-info/
 .DS_Store
 ema_breakout_trades.csv
-dhan_scrip_master.csv
