@@ -76,17 +76,21 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY CONSTANTS (exact same as working terminal version)
+# STRATEGY DEFAULTS (overridable from GUI)
 # ─────────────────────────────────────────────────────────────────────────────
-EMA_PERIOD          = 89
-CANDLE_INTERVAL_SEC = 300
-TARGET_POINTS       = 15.0
-ITM_OFFSET          = 100
-NIFTY_STRIKE_GAP    = 50
-BANKNIFTY_STRIKE_GAP = 100
+DEFAULT_EMA_PERIOD    = 89
+DEFAULT_CANDLE_TF     = 5          # minutes
+DEFAULT_TARGET_POINTS = 15.0
+DEFAULT_ITM_OFFSET    = 100
+DEFAULT_QTY_MULT      = 1
+NIFTY_STRIKE_GAP      = 50
+BANKNIFTY_STRIKE_GAP  = 100
+
+# Candle TF choices (minutes → seconds)
+TF_OPTIONS = {"1": 60, "3": 180, "5": 300, "15": 900}
 
 INDEX_CONFIG = {
-    "NIFTY":     {"security_id": "13", "strike_gap": NIFTY_STRIKE_GAP,     "lot_size": 75},
+    "NIFTY":     {"security_id": "13", "strike_gap": NIFTY_STRIKE_GAP,     "lot_size": 65},
     "BANKNIFTY": {"security_id": "25", "strike_gap": BANKNIFTY_STRIKE_GAP, "lot_size": 30},
 }
 
@@ -137,9 +141,9 @@ def epoch_to_ist_str(ts, fmt="%H:%M:%S"):
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.fromtimestamp(ts, tz=ist).strftime(fmt)
 
-def five_min_bucket(epoch_sec):
+def five_min_bucket(epoch_sec, interval_sec=300):
     epoch_sec = _normalize_dhan_epoch(int(epoch_sec))
-    return epoch_sec - (epoch_sec % CANDLE_INTERVAL_SEC)
+    return epoch_sec - (epoch_sec % interval_sec)
 
 def now_ist():
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
@@ -257,9 +261,9 @@ def fetch_option_chain(idx, expiry):
         d = resp["data"]; return {"spot_price":float(d["last_price"]),"oc":d["oc"]}
     return None
 
-def select_itm_strikes(idx, spot, oc_data):
+def select_itm_strikes(idx, spot, oc_data, itm_offset=100):
     cfg = INDEX_CONFIG[idx]; gap = cfg["strike_gap"]
-    atm = round(spot/gap)*gap; itm_ce = atm - ITM_OFFSET; itm_pe = atm + ITM_OFFSET
+    atm = round(spot/gap)*gap; itm_ce = atm - itm_offset; itm_pe = atm + itm_offset
     oc = oc_data["oc"]; ce_info = pe_info = None
     for k in oc:
         try:
@@ -275,12 +279,12 @@ def select_itm_strikes(idx, spot, oc_data):
         except: continue
     return ce_info, pe_info
 
-def fetch_historical_5min(security_id, days_back=10):
+def fetch_historical_5min(security_id, days_back=10, tf_minutes=5):
     to_d = now_ist().strftime("%Y-%m-%d")
     fr_d = (now_ist() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     resp = api_post("/charts/intraday",
                     {"securityId":str(security_id),"exchangeSegment":"NSE_FNO",
-                     "instrument":"OPTIDX","interval":"5","fromDate":fr_d,"toDate":to_d})
+                     "instrument":"OPTIDX","interval":str(tf_minutes),"fromDate":fr_d,"toDate":to_d})
     if not resp or "open" not in resp or not resp["open"]: return None
     df = pd.DataFrame({"timestamp":resp["timestamp"],
                         "open":[float(x) for x in resp["open"]],
@@ -342,14 +346,15 @@ class EMACalculator:
 # 5-MIN CANDLE ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 class FiveMinCandleEngine:
-    def __init__(self, sec_id, label, on_close=None):
+    def __init__(self, sec_id, label, on_close=None, interval_sec=300):
         self.sec_id=sec_id; self.label=label; self.on_close=on_close
+        self.interval_sec=interval_sec
         self.lock=threading.Lock(); self.current=None
         self.last_ltp=None; self.last_ltt=None; self.tick_count=0
 
     def on_tick(self, ltp, ltt_epoch):
         ltp=float(ltp); ltt_epoch=_normalize_dhan_epoch(int(ltt_epoch))
-        bucket=five_min_bucket(ltt_epoch)
+        bucket=five_min_bucket(ltt_epoch, self.interval_sec)
         with self.lock:
             self.last_ltp=ltp; self.last_ltt=ltt_epoch; self.tick_count+=1
             if self.current is None:
@@ -401,8 +406,17 @@ class Trade:
 # STRATEGY ENGINE (headless — talks to GUI via Queue)
 # ─────────────────────────────────────────────────────────────────────────────
 class StrategyEngine:
-    def __init__(self, indices, log_q):
+    def __init__(self, indices, log_q, params=None):
         self.indices=indices; self.log_q=log_q; self.stop_event=threading.Event()
+        # User-configurable params
+        p = params or {}
+        self.ema_period    = p.get("ema_period", DEFAULT_EMA_PERIOD)
+        self.candle_tf_min = p.get("candle_tf", DEFAULT_CANDLE_TF)
+        self.candle_tf_sec = TF_OPTIONS.get(str(self.candle_tf_min), self.candle_tf_min * 60)
+        self.target_points = p.get("target_points", DEFAULT_TARGET_POINTS)
+        self.itm_offset    = p.get("itm_offset", DEFAULT_ITM_OFFSET)
+        self.qty_mult      = p.get("qty_mult", DEFAULT_QTY_MULT)
+
         self.expiry={}; self.spot_price={}; self.lot_sizes={}
         self.ce_info={}; self.pe_info={}
         self.ema_calcs={}; self.ema_label={}
@@ -419,10 +433,13 @@ class StrategyEngine:
         self.log_q.put(f"[{ts}] {msg}")
 
     def initialize(self):
+        self.log(f"═══ Params: EMA={self.ema_period}  TF={self.candle_tf_min}m  "
+                 f"Target={self.target_points}pts  ITM={self.itm_offset}  QtyMult={self.qty_mult}x ═══")
         for idx in self.indices:
             self.log(f"[{idx}] Initializing...")
-            self.lot_sizes[idx] = fetch_lot_size(idx)
-            self.log(f"[{idx}] Lot size: {self.lot_sizes[idx]}")
+            base_lot = fetch_lot_size(idx)
+            self.lot_sizes[idx] = base_lot * self.qty_mult
+            self.log(f"[{idx}] Lot: {base_lot} × {self.qty_mult} = {self.lot_sizes[idx]}")
             exp = get_current_week_expiry(idx)
             if not exp: self.log(f"[{idx}] ❌ No expiry"); continue
             self.expiry[idx] = exp
@@ -437,7 +454,7 @@ class StrategyEngine:
         if not oc: self.log(f"[{idx}] ❌ Option chain failed"); return
         spot = oc["spot_price"]; self.spot_price[idx] = spot
         self.log(f"[{idx}] Spot: {spot:.2f}")
-        ce, pe = select_itm_strikes(idx, spot, oc)
+        ce, pe = select_itm_strikes(idx, spot, oc, itm_offset=self.itm_offset)
         self.ce_info[idx]=ce; self.pe_info[idx]=pe
         if ce:
             self.log(f"[{idx}] CE: {int(ce['strike'])} | secId={ce['security_id']} | LTP={ce['last_price']:.2f}")
@@ -451,10 +468,10 @@ class StrategyEngine:
         sec_id=info["security_id"]; label=f"{idx} {int(info['strike'])}{opt_type}"
         self.ema_label[sec_id]=label
         self.log(f"  Fetching history for {label}...")
-        df = fetch_historical_5min(sec_id, days_back=10)
-        ema = EMACalculator(EMA_PERIOD)
+        df = fetch_historical_5min(sec_id, days_back=10, tf_minutes=self.candle_tf_min)
+        ema = EMACalculator(self.ema_period)
         if df is not None and len(df)>0:
-            now_epoch=int(time.time()); cb=five_min_bucket(now_epoch)
+            now_epoch=int(time.time()); cb=five_min_bucket(now_epoch, self.candle_tf_sec)
             if len(df)>1 and int(df.iloc[-1]["timestamp"])>=cb:
                 df=df.iloc[:-1].copy()
             ema.seed_from_historical(df)
@@ -463,7 +480,8 @@ class StrategyEngine:
         else:
             self.log(f"  {label}: No history — building from live")
         self.ema_calcs[sec_id]=ema
-        self.candle_engines[sec_id]=FiveMinCandleEngine(sec_id,label,on_close=self.on_candle_close)
+        self.candle_engines[sec_id]=FiveMinCandleEngine(sec_id,label,
+            on_close=self.on_candle_close, interval_sec=self.candle_tf_sec)
         self.ws_instruments.append({"name":label,"exchange":"NSE_FNO","security_id":sec_id})
 
     # ── STRATEGY LOGIC ──
@@ -502,7 +520,7 @@ class StrategyEngine:
                         trade=Trade(index=idx_name,option_type=info["option_type"],
                                     strike=info["strike"],security_id=sec_id,entry_price=c,
                                     entry_time=epoch_to_ist_str(ts,"%H:%M:%S"),
-                                    target=c+TARGET_POINTS,stop_loss=ema_l,
+                                    target=c+self.target_points,stop_loss=ema_l,
                                     lot_size=self.lot_sizes.get(idx_name,INDEX_CONFIG[idx_name]["lot_size"]))
                         self.active_trades[sec_id]=trade
                         self.log(f"▶ ENTRY  {idx_name} {int(info['strike'])}{info['option_type']}  "
@@ -643,7 +661,7 @@ class StrategyEngine:
                 "completed":self.completed_trades[-15:],"total_pnl":total,
                 "wins":wins,"total_trades":len(self.completed_trades),
                 "packets":self.packet_count,"ws_ok":self.ws_connected.is_set(),
-                "ws_err":self.last_ws_error}
+                "ws_err":self.last_ws_error,"ema_period":self.ema_period}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -801,6 +819,44 @@ class StrategyTab(ctk.CTkFrame):
                                         text_color=WHITE, command=self._toggle)
         self.start_btn.pack(side="left")
 
+        # ── SETTINGS PANEL ──
+        settings = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=12,
+                                border_width=1, border_color=BORDER)
+        settings.pack(fill="x", padx=12, pady=(8, 0))
+
+        stitle = ctk.CTkFrame(settings, fg_color="transparent")
+        stitle.pack(fill="x", padx=14, pady=(10, 6))
+        ctk.CTkLabel(stitle, text="⚙  Parameters", font=F_HEAD,
+                     text_color=GREY_LT).pack(side="left")
+
+        sparams = ctk.CTkFrame(settings, fg_color="transparent")
+        sparams.pack(fill="x", padx=14, pady=(0, 12))
+
+        # EMA Period
+        self.ema_var = ctk.StringVar(value=str(DEFAULT_EMA_PERIOD))
+        self._param_field(sparams, "EMA Period", self.ema_var,
+                          ["21", "50", "89", "144", "200"], 0)
+
+        # Candle TF
+        self.tf_var = ctk.StringVar(value=str(DEFAULT_CANDLE_TF))
+        self._param_field(sparams, "Candle TF (min)", self.tf_var,
+                          ["1", "3", "5", "15"], 1)
+
+        # Target Points
+        self.tgt_var = ctk.StringVar(value=str(int(DEFAULT_TARGET_POINTS)))
+        self._param_field(sparams, "Target (pts)", self.tgt_var,
+                          ["5", "10", "15", "20", "25", "30"], 2)
+
+        # ITM Offset
+        self.itm_var = ctk.StringVar(value=str(DEFAULT_ITM_OFFSET))
+        self._param_field(sparams, "ITM Offset", self.itm_var,
+                          ["50", "100", "150", "200", "300"], 3)
+
+        # Qty Multiplier
+        self.qty_var = ctk.StringVar(value=str(DEFAULT_QTY_MULT))
+        self._param_field(sparams, "Qty Multiplier", self.qty_var,
+                          ["1", "2", "3", "5", "10"], 4)
+
         # ── SCROLLABLE BODY ──
         body = ctk.CTkScrollableFrame(self, fg_color=BG_DEEP)
         body.pack(fill="both", expand=True, padx=12, pady=(8, 0))
@@ -867,6 +923,16 @@ class StrategyTab(ctk.CTkFrame):
                                        corner_radius=8, state="disabled")
         self.log_box.pack(fill="x", padx=16, pady=(0,12))
 
+    def _param_field(self, parent, label, var, options, col):
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        f.pack(side="left", padx=(0, 16), fill="x", expand=True)
+        ctk.CTkLabel(f, text=label, font=F_SMALL, text_color=GREY).pack(anchor="w")
+        ctk.CTkOptionMenu(f, variable=var, values=options, font=F_MONO,
+                          width=100, height=30, fg_color=BG_INPUT,
+                          button_color=TEAL_DIM, button_hover_color=TEAL,
+                          dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HI,
+                          text_color=WHITE, corner_radius=8).pack(anchor="w", pady=(2, 0))
+
     def _stat_card(self, parent, title, value, col):
         c = make_card(parent, height=85)
         c.grid(row=0, column=col, sticky="nsew", padx=(0 if col==0 else 6, 0))
@@ -887,7 +953,17 @@ class StrategyTab(ctk.CTkFrame):
             return
         choice = self.idx_var.get()
         indices = ["NIFTY","BANKNIFTY"] if choice=="BOTH" else [choice]
-        self.engine = StrategyEngine(indices, self.log_q)
+
+        # Read params from GUI
+        params = {
+            "ema_period":    int(self.ema_var.get()),
+            "candle_tf":     int(self.tf_var.get()),
+            "target_points": float(self.tgt_var.get()),
+            "itm_offset":    int(self.itm_var.get()),
+            "qty_mult":      int(self.qty_var.get()),
+        }
+
+        self.engine = StrategyEngine(indices, self.log_q, params=params)
         self.running = True
         self.start_btn.configure(text="◼  Stop", fg_color=RED_DIM, hover_color=RED)
         threading.Thread(target=self.engine.run, daemon=True).start()
@@ -945,7 +1021,7 @@ class StrategyTab(ctk.CTkFrame):
             elif opt["ready"]:
                 make_pill(top_r, "watching", fg=GREY, bg=BG_CARD).pack(side="right")
             else:
-                make_pill(top_r, f"warmup {opt['candle_count']}/{EMA_PERIOD}",
+                make_pill(top_r, f"warmup {opt['candle_count']}/{d.get('ema_period', DEFAULT_EMA_PERIOD)}",
                          fg=AMBER, bg=BG_CARD).pack(side="right")
 
             # Bottom row: LTP + EMAs
@@ -1001,7 +1077,7 @@ class StrategyTab(ctk.CTkFrame):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Balfund — EMA 89 Breakout Options")
+        self.title("Balfund — EMA Breakout Options")
         self.geometry("1120x800")
         self.minsize(960, 680)
         self.configure(fg_color=BG_DEEP)
@@ -1026,7 +1102,7 @@ class App(ctk.CTk):
         # Strategy info
         info_frame = ctk.CTkFrame(sb, fg_color=BG_CARD, corner_radius=10)
         info_frame.pack(fill="x", padx=12, pady=(0,12))
-        for line in ["EMA 89 (High/Low)", "5-min · ITM 100pt", "Target +15 · Trail SL"]:
+        for line in ["EMA Breakout (High/Low)", "Configurable TF & Params", "Trailing SL · Auto Refresh"]:
             ctk.CTkLabel(info_frame, text=line, font=F_SMALL,
                          text_color=GREY_LT).pack(anchor="w", padx=12, pady=(4,0))
         ctk.CTkLabel(info_frame, text="", font=F_SMALL).pack(pady=(0,6))
