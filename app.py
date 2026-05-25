@@ -104,10 +104,10 @@ INDEX_CONFIG = {
                    "underlying_seg": "MCX_COMM", "opt_instrument": "OPTFUT",
                    "opt_exchange": "MCX_COMM",   "mode": "options",
                    "mcx_symbol": "CRUDEOIL",     "default_itm": 100},
-    "NATURALGAS": {"security_id": None,  "strike_gap": 2,   "lot_size": 1250,
+    "NATURALGAS": {"security_id": None,  "strike_gap": 5,   "lot_size": 1250,
                    "underlying_seg": "MCX_COMM", "opt_instrument": "OPTFUT",
                    "opt_exchange": "MCX_COMM",   "mode": "options",
-                   "mcx_symbol": "NATURALGAS",   "default_itm": 4},
+                   "mcx_symbol": "NATURALGAS",   "default_itm": 10},
     # ── MCX Futures (trade the futures contract directly) ──
     "GOLDTEN":    {"security_id": None,  "lot_size": 10,
                    "exchange": "MCX_COMM", "instrument": "FUTCOM",
