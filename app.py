@@ -90,9 +90,32 @@ BANKNIFTY_STRIKE_GAP  = 100
 TF_OPTIONS = {"1": 60, "3": 180, "5": 300, "15": 900}
 
 INDEX_CONFIG = {
-    "NIFTY":     {"security_id": "13", "strike_gap": NIFTY_STRIKE_GAP,     "lot_size": 65},
-    "BANKNIFTY": {"security_id": "25", "strike_gap": BANKNIFTY_STRIKE_GAP, "lot_size": 30},
+    # ── NSE Index Options (CE/PE on ITM strike) ──
+    "NIFTY":      {"security_id": "13",  "strike_gap": NIFTY_STRIKE_GAP,     "lot_size": 65,
+                   "underlying_seg": "IDX_I",    "opt_instrument": "OPTIDX",
+                   "opt_exchange": "NSE_FNO",    "mode": "options"},
+    "BANKNIFTY":  {"security_id": "25",  "strike_gap": BANKNIFTY_STRIKE_GAP, "lot_size": 30,
+                   "underlying_seg": "IDX_I",    "opt_instrument": "OPTIDX",
+                   "opt_exchange": "NSE_FNO",    "mode": "options"},
+    # ── MCX Commodity Options (CE/PE on ITM strike of futures) ──
+    "CRUDEOIL":   {"security_id": None,  "strike_gap": 50,  "lot_size": 100,
+                   "underlying_seg": "MCX_COMM", "opt_instrument": "OPTFUT",
+                   "opt_exchange": "MCX_COMM",   "mode": "options",
+                   "mcx_symbol": "CRUDEOIL"},
+    "NATURALGAS": {"security_id": None,  "strike_gap": 2,   "lot_size": 1250,
+                   "underlying_seg": "MCX_COMM", "opt_instrument": "OPTFUT",
+                   "opt_exchange": "MCX_COMM",   "mode": "options",
+                   "mcx_symbol": "NATURALGAS"},
+    # ── MCX Futures (trade the futures contract directly) ──
+    "GOLDTEN":    {"security_id": None,  "lot_size": 10,
+                   "exchange": "MCX_COMM", "instrument": "FUTCOM",
+                   "mcx_symbol": "GOLDTEN",   "mode": "futures"},
+    "SILVERMIC":  {"security_id": None,  "lot_size": 1,
+                   "exchange": "MCX_COMM", "instrument": "FUTCOM",
+                   "mcx_symbol": "SILVERMIC", "mode": "futures"},
 }
+
+SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 BASE_URL          = "https://api.dhan.co/v2"
 AUTH_GENERATE_URL = "https://auth.dhan.co/app/generateAccessToken"
@@ -236,10 +259,62 @@ def api_post(endpoint, payload, retries=2):
         if attempt < retries: time.sleep(1)
     return None
 
+
+# ── MCX Near-Month Futures Resolver ──
+def resolve_mcx_near_month(symbol_name):
+    """Download Dhan scrip master and find the near-month FUTCOM security_id
+       for a given MCX symbol (e.g. CRUDEOIL, NATURALGAS).
+       Returns (security_id_str, expiry_date_str) or (None, None)."""
+    try:
+        r = requests.get(SCRIP_MASTER_URL, timeout=40)
+        r.raise_for_status()
+        lines = r.text.splitlines()
+        header = [h.strip() for h in lines[0].split(",")]
+        idx_map = {h: i for i, h in enumerate(header)}
+
+        today_str = now_ist().strftime("%Y-%m-%d")
+        candidates = []
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) < len(header): continue
+            seg  = parts[idx_map.get("SEM_SEGMENT", -1)].strip()
+            inst = parts[idx_map.get("SEM_INSTRUMENT_NAME", -1)].strip()
+            sname = parts[idx_map.get("SM_SYMBOL_NAME", -1)].strip().upper()
+            if seg == "MCX_COMM" and inst == "FUTCOM" and sname == symbol_name.upper():
+                sid = parts[idx_map.get("SEM_SMST_SECURITY_ID", -1)].strip()
+                exp = parts[idx_map.get("SEM_EXPIRY_DATE", -1)].strip()[:10]
+                if exp >= today_str:
+                    candidates.append((exp, sid))
+
+        candidates.sort()
+        if candidates:
+            return candidates[0][1], candidates[0][0]
+    except Exception:
+        pass
+    return None, None
+
+
+def ensure_mcx_security_ids():
+    """Resolve near-month futures security_id for all MCX instruments (options & futures)."""
+    needs_resolve = [k for k, v in INDEX_CONFIG.items()
+                     if v.get("mcx_symbol") and not v.get("security_id")]
+    if not needs_resolve:
+        return
+    for idx in needs_resolve:
+        cfg = INDEX_CONFIG[idx]
+        sym = cfg["mcx_symbol"]
+        sid, exp = resolve_mcx_near_month(sym)
+        if sid:
+            cfg["security_id"] = sid
+            cfg["mcx_expiry"] = exp
+
+
 def fetch_expiry_list(idx):
     cfg = INDEX_CONFIG[idx]
+    if not cfg.get("security_id"): return []
     resp = api_post("/optionchain/expirylist",
-                    {"UnderlyingScrip":int(cfg["security_id"]),"UnderlyingSeg":"IDX_I"})
+                    {"UnderlyingScrip":int(cfg["security_id"]),
+                     "UnderlyingSeg":cfg["underlying_seg"]})
     return resp.get("data",[]) if resp and resp.get("status")=="success" else []
 
 def get_current_week_expiry(idx):
@@ -255,8 +330,11 @@ def get_current_week_expiry(idx):
 
 def fetch_option_chain(idx, expiry):
     cfg = INDEX_CONFIG[idx]
+    if not cfg.get("security_id"): return None
     resp = api_post("/optionchain",
-                    {"UnderlyingScrip":int(cfg["security_id"]),"UnderlyingSeg":"IDX_I","Expiry":expiry})
+                    {"UnderlyingScrip":int(cfg["security_id"]),
+                     "UnderlyingSeg":cfg["underlying_seg"],
+                     "Expiry":expiry})
     if resp and resp.get("status")=="success":
         d = resp["data"]; return {"spot_price":float(d["last_price"]),"oc":d["oc"]}
     return None
@@ -279,12 +357,12 @@ def select_itm_strikes(idx, spot, oc_data, itm_offset=100):
         except: continue
     return ce_info, pe_info
 
-def fetch_historical_5min(security_id, days_back=10, tf_minutes=5):
+def fetch_historical_5min(security_id, days_back=10, tf_minutes=5, exchange_seg="NSE_FNO", instrument="OPTIDX"):
     to_d = now_ist().strftime("%Y-%m-%d")
     fr_d = (now_ist() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     resp = api_post("/charts/intraday",
-                    {"securityId":str(security_id),"exchangeSegment":"NSE_FNO",
-                     "instrument":"OPTIDX","interval":str(tf_minutes),"fromDate":fr_d,"toDate":to_d})
+                    {"securityId":str(security_id),"exchangeSegment":exchange_seg,
+                     "instrument":instrument,"interval":str(tf_minutes),"fromDate":fr_d,"toDate":to_d})
     if not resp or "open" not in resp or not resp["open"]: return None
     df = pd.DataFrame({"timestamp":resp["timestamp"],
                         "open":[float(x) for x in resp["open"]],
@@ -296,50 +374,101 @@ def fetch_historical_5min(security_id, days_back=10, tf_minutes=5):
     return df
 
 def fetch_lot_size(idx):
+    cfg = INDEX_CONFIG[idx]
+    inst_type = cfg.get("opt_instrument", "OPTIDX")
     try:
         from io import StringIO
         r = requests.get("https://images.dhan.co/api-data/api-scrip-master-detailed.csv", timeout=20)
         r.raise_for_status()
         df = pd.read_csv(StringIO(r.text),
                          usecols=["SYMBOL_NAME","INSTRUMENT","SEM_LOT_UNITS"],low_memory=False)
-        df = df[(df["INSTRUMENT"]=="OPTIDX")&(df["SYMBOL_NAME"]==idx)]
+        df = df[(df["INSTRUMENT"]==inst_type)&(df["SYMBOL_NAME"]==idx)]
         if not df.empty:
             lot = int(df.iloc[0]["SEM_LOT_UNITS"])
             if lot > 0: return lot
     except: pass
-    return INDEX_CONFIG[idx]["lot_size"]
+    return cfg["lot_size"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMA CALCULATOR — TradingView ta.ema() exact match
+# EMA CALCULATOR — with SMA smoothing (matches Dhan EMA indicator)
+#   Step 1: EMA(period, source=high/low) — standard recursive EMA
+#   Step 2: SMA(smooth_len) applied on top of the EMA values
+#   The smoothed value is what we use for signals.
+#   Dhan settings: Length=89, Smoothing Line=SMA, Smoothing Length=9
 # ─────────────────────────────────────────────────────────────────────────────
 class EMACalculator:
-    def __init__(self, period=89):
-        self.period = period; self.k = 2.0/(period+1.0)
-        self.ema_high = None; self.ema_low = None; self.candle_count = 0
+    def __init__(self, period=89, smooth_len=9):
+        self.period = period
+        self.smooth_len = smooth_len
+        self.k = 2.0 / (period + 1.0)
+
+        # Raw EMA values (before smoothing)
+        self.ema_high_raw = None
+        self.ema_low_raw = None
+
+        # SMA smoothing buffers — hold last smooth_len raw EMA values
+        self._buf_h = deque(maxlen=smooth_len)
+        self._buf_l = deque(maxlen=smooth_len)
+
+        # Final smoothed values (EMA → SMA)
+        self.ema_high = None
+        self.ema_low = None
+
+        self.candle_count = 0
         self.candles = deque(maxlen=200)
 
     def seed_from_historical(self, df):
-        self.candles.clear(); self.ema_high = self.ema_low = None; self.candle_count = 0
-        for _,row in df.iterrows():
-            self._proc(int(row["timestamp"]),float(row["open"]),float(row["high"]),
-                       float(row["low"]),float(row["close"]),int(row.get("volume",0)))
+        self.candles.clear()
+        self.ema_high_raw = self.ema_low_raw = None
+        self.ema_high = self.ema_low = None
+        self._buf_h.clear(); self._buf_l.clear()
+        self.candle_count = 0
+        for _, row in df.iterrows():
+            self._proc(int(row["timestamp"]), float(row["open"]),
+                       float(row["high"]), float(row["low"]),
+                       float(row["close"]), int(row.get("volume", 0)))
 
     def _proc(self, ts, o, h, l, c, v=0):
         self.candle_count += 1
-        if self.ema_high is None: self.ema_high = h; self.ema_low = l
-        else:
-            self.ema_high = h*self.k + self.ema_high*(1.0-self.k)
-            self.ema_low  = l*self.k + self.ema_low*(1.0-self.k)
-        self.candles.append({"ts":ts,"o":o,"h":h,"l":l,"c":c,"v":v,
-                             "ema_h":self.ema_high,"ema_l":self.ema_low})
 
-    def update_candle(self, ts, o, h, l, c, v=0): self._proc(ts,o,h,l,c,v)
-    def is_ready(self): return self.candle_count >= self.period and self.ema_high is not None
+        # Step 1: standard EMA on high and low
+        if self.ema_high_raw is None:
+            self.ema_high_raw = h
+            self.ema_low_raw = l
+        else:
+            self.ema_high_raw = h * self.k + self.ema_high_raw * (1.0 - self.k)
+            self.ema_low_raw  = l * self.k + self.ema_low_raw  * (1.0 - self.k)
+
+        # Step 2: SMA smoothing on the raw EMA values
+        self._buf_h.append(self.ema_high_raw)
+        self._buf_l.append(self.ema_low_raw)
+
+        if len(self._buf_h) == self.smooth_len:
+            self.ema_high = sum(self._buf_h) / self.smooth_len
+            self.ema_low  = sum(self._buf_l) / self.smooth_len
+        else:
+            # Not enough data for full SMA yet — use raw EMA as fallback
+            self.ema_high = self.ema_high_raw
+            self.ema_low  = self.ema_low_raw
+
+        self.candles.append({"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": v,
+                             "ema_h": self.ema_high, "ema_l": self.ema_low})
+
+    def update_candle(self, ts, o, h, l, c, v=0):
+        self._proc(ts, o, h, l, c, v)
+
+    def is_ready(self):
+        return (self.candle_count >= self.period
+                and len(self._buf_h) == self.smooth_len
+                and self.ema_high is not None)
+
     def get_values(self):
-        return (round(self.ema_high,2) if self.ema_high else None,
-                round(self.ema_low,2)  if self.ema_low  else None)
-    def last_n(self, n=5): return list(self.candles)[-n:]
+        return (round(self.ema_high, 2) if self.ema_high else None,
+                round(self.ema_low, 2)  if self.ema_low  else None)
+
+    def last_n(self, n=5):
+        return list(self.candles)[-n:]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -416,6 +545,7 @@ class StrategyEngine:
         self.target_points = p.get("target_points", DEFAULT_TARGET_POINTS)
         self.itm_offset    = p.get("itm_offset", DEFAULT_ITM_OFFSET)
         self.qty_mult      = p.get("qty_mult", DEFAULT_QTY_MULT)
+        self.smooth_len    = p.get("smooth_len", 9)
 
         self.expiry={}; self.spot_price={}; self.lot_sizes={}
         self.ce_info={}; self.pe_info={}
@@ -433,19 +563,78 @@ class StrategyEngine:
         self.log_q.put(f"[{ts}] {msg}")
 
     def initialize(self):
-        self.log(f"═══ Params: EMA={self.ema_period}  TF={self.candle_tf_min}m  "
+        self.log(f"═══ Params: EMA={self.ema_period}  Smooth={self.smooth_len}  TF={self.candle_tf_min}m  "
                  f"Target={self.target_points}pts  ITM={self.itm_offset}  QtyMult={self.qty_mult}x ═══")
+        # Resolve MCX near-month futures security IDs (needed for both options & futures mode)
+        mcx_list = [i for i in self.indices if INDEX_CONFIG[i].get("mcx_symbol")]
+        if mcx_list:
+            self.log("Resolving MCX near-month futures from scrip master...")
+            ensure_mcx_security_ids()
+            for mi in mcx_list:
+                cfg = INDEX_CONFIG[mi]
+                if cfg.get("security_id"):
+                    self.log(f"[{mi}] secId={cfg['security_id']} exp={cfg.get('mcx_expiry','?')} mode={cfg['mode']}")
+                else:
+                    self.log(f"[{mi}] ❌ Could not resolve MCX contract")
+
         for idx in self.indices:
+            cfg = INDEX_CONFIG[idx]
             self.log(f"[{idx}] Initializing...")
             base_lot = fetch_lot_size(idx)
             self.lot_sizes[idx] = base_lot * self.qty_mult
             self.log(f"[{idx}] Lot: {base_lot} × {self.qty_mult} = {self.lot_sizes[idx]}")
-            exp = get_current_week_expiry(idx)
-            if not exp: self.log(f"[{idx}] ❌ No expiry"); continue
-            self.expiry[idx] = exp
-            self.log(f"[{idx}] Expiry: {exp}")
-            self._select_strikes(idx)
+
+            if cfg["mode"] == "futures":
+                # MCX FUTURES — trade the futures contract directly
+                self._init_futures(idx)
+            else:
+                # NSE OPTIONS — select ITM strikes, trade CE/PE
+                exp = get_current_week_expiry(idx)
+                if not exp: self.log(f"[{idx}] ❌ No expiry"); continue
+                self.expiry[idx] = exp
+                self.log(f"[{idx}] Expiry: {exp}")
+                self._select_strikes(idx)
         return bool(self.ws_instruments)
+
+    def _init_futures(self, idx):
+        """Set up a MCX futures instrument — no option chain, trade futures directly."""
+        cfg = INDEX_CONFIG[idx]
+        sec_id = cfg.get("security_id")
+        if not sec_id:
+            self.log(f"[{idx}] ❌ No security_id resolved — skipping")
+            return
+        exp = cfg.get("mcx_expiry", "?")
+        self.expiry[idx] = exp
+        label = f"{idx} FUT"
+        self.ema_label[sec_id] = label
+
+        self.log(f"  Fetching history for {label} (secId={sec_id})...")
+        df = fetch_historical_5min(sec_id, days_back=10, tf_minutes=self.candle_tf_min,
+                                   exchange_seg=cfg["exchange"], instrument=cfg["instrument"])
+        ema = EMACalculator(self.ema_period, self.smooth_len)
+        if df is not None and len(df) > 0:
+            now_epoch = int(time.time())
+            cb = five_min_bucket(now_epoch, self.candle_tf_sec)
+            if len(df) > 1 and int(df.iloc[-1]["timestamp"]) >= cb:
+                df = df.iloc[:-1].copy()
+            ema.seed_from_historical(df)
+            eh, el = ema.get_values()
+            self.log(f"  {label}: {len(df)} candles | EMA_H={eh} | EMA_L={el} | Ready={ema.is_ready()}")
+        else:
+            self.log(f"  {label}: No history — building from live")
+
+        self.ema_calcs[sec_id] = ema
+        self.candle_engines[sec_id] = FiveMinCandleEngine(
+            sec_id, label, on_close=self.on_candle_close, interval_sec=self.candle_tf_sec)
+        self.ws_instruments.append({"name": label, "exchange": cfg["exchange"], "security_id": sec_id})
+
+        # Store as if it were a single "strike" for unified trade logic
+        self.ce_info[idx] = {
+            "strike": 0, "security_id": sec_id,
+            "last_price": 0, "option_type": "FUT",
+        }
+        self.pe_info[idx] = None  # no PE for futures
+        self.needs_refresh[idx] = False
 
     def _select_strikes(self, idx):
         exp = self.expiry.get(idx)
@@ -468,8 +657,11 @@ class StrategyEngine:
         sec_id=info["security_id"]; label=f"{idx} {int(info['strike'])}{opt_type}"
         self.ema_label[sec_id]=label
         self.log(f"  Fetching history for {label}...")
-        df = fetch_historical_5min(sec_id, days_back=10, tf_minutes=self.candle_tf_min)
-        ema = EMACalculator(self.ema_period)
+        cfg = INDEX_CONFIG[idx]
+        df = fetch_historical_5min(sec_id, days_back=10, tf_minutes=self.candle_tf_min,
+                                   exchange_seg=cfg["opt_exchange"],
+                                   instrument=cfg["opt_instrument"])
+        ema = EMACalculator(self.ema_period, self.smooth_len)
         if df is not None and len(df)>0:
             now_epoch=int(time.time()); cb=five_min_bucket(now_epoch, self.candle_tf_sec)
             if len(df)>1 and int(df.iloc[-1]["timestamp"])>=cb:
@@ -482,7 +674,8 @@ class StrategyEngine:
         self.ema_calcs[sec_id]=ema
         self.candle_engines[sec_id]=FiveMinCandleEngine(sec_id,label,
             on_close=self.on_candle_close, interval_sec=self.candle_tf_sec)
-        self.ws_instruments.append({"name":label,"exchange":"NSE_FNO","security_id":sec_id})
+        cfg = INDEX_CONFIG[idx]
+        self.ws_instruments.append({"name":label,"exchange":cfg["opt_exchange"],"security_id":sec_id})
 
     # ── STRATEGY LOGIC ──
     def on_candle_close(self, sec_id, candle):
@@ -540,7 +733,11 @@ class StrategyEngine:
         for idx in self.indices:
             ci=self.ce_info.get(idx); pi=self.pe_info.get(idx)
             if (ci and ci["security_id"]==sec_id) or (pi and pi["security_id"]==sec_id):
-                self.needs_refresh[idx]=True
+                # For futures mode, no strike refresh needed — keep trading same contract
+                if INDEX_CONFIG[idx]["mode"] == "futures":
+                    self.needs_refresh[idx] = False
+                else:
+                    self.needs_refresh[idx] = True
 
     def _save_csv(self, t):
         exists = LOG_CSV.exists()
@@ -578,14 +775,22 @@ class StrategyEngine:
     # ── WEBSOCKET ──
     def on_ws_open(self, ws):
         self.ws_connected.set()
-        spot_instr=[{"ExchangeSegment":"IDX_I","SecurityId":INDEX_CONFIG[idx]["security_id"]}
-                    for idx in self.indices]
+        # For NSE options, subscribe to index spot (IDX_I) separately
+        # For MCX futures, the futures tick IS the price — no separate spot needed
+        spot_instr = []
         for idx in self.indices:
-            self.spot_engines[idx]=FiveMinCandleEngine(INDEX_CONFIG[idx]["security_id"],f"{idx} SPOT")
-        opt_instr=[{"ExchangeSegment":str(i["exchange"]),"SecurityId":str(i["security_id"])}
-                   for i in self.ws_instruments]
-        all_i=spot_instr+opt_instr
-        ws.send(json.dumps({"RequestCode":REQ_SUB_TICKER,"InstrumentCount":len(all_i),"InstrumentList":all_i}))
+            cfg = INDEX_CONFIG[idx]
+            if cfg["mode"] == "options":
+                spot_instr.append({"ExchangeSegment": cfg["underlying_seg"],
+                                   "SecurityId": cfg["security_id"]})
+                self.spot_engines[idx] = FiveMinCandleEngine(cfg["security_id"], f"{idx} SPOT")
+            # For futures, spot_price is updated from the same futures tick in on_ws_message
+
+        opt_instr = [{"ExchangeSegment": str(i["exchange"]), "SecurityId": str(i["security_id"])}
+                     for i in self.ws_instruments]
+        all_i = spot_instr + opt_instr
+        ws.send(json.dumps({"RequestCode": REQ_SUB_TICKER, "InstrumentCount": len(all_i),
+                            "InstrumentList": all_i}))
         self.log(f"📡 WebSocket connected — {len(all_i)} instruments")
 
     def on_ws_message(self, ws, message):
@@ -795,29 +1000,35 @@ class StrategyTab(ctk.CTkFrame):
 
     def _build(self):
         # ── TOP BAR ──
-        top = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=64)
+        top = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=50)
         top.pack(fill="x"); top.pack_propagate(False)
 
         ctk.CTkLabel(top, text="  Strategy Dashboard", font=F_TITLE,
                      text_color=TEAL).pack(side="left", padx=20)
 
-        ctrl = ctk.CTkFrame(top, fg_color="transparent")
-        ctrl.pack(side="right", padx=20)
-
-        ctk.CTkLabel(ctrl, text="Index", font=F_SMALL, text_color=GREY).pack(side="left", padx=(0,4))
-        self.idx_var = ctk.StringVar(value="NIFTY")
-        ctk.CTkSegmentedButton(ctrl, values=["NIFTY","BANKNIFTY","BOTH"],
-                               variable=self.idx_var, font=F_SMALL, height=32,
-                               fg_color=BG_CARD, selected_color=TEAL_DIM,
-                               selected_hover_color=TEAL,
-                               unselected_color=BG_CARD,
-                               unselected_hover_color=BG_CARD_HI,
-                               text_color=WHITE).pack(side="left", padx=(0,12))
-        self.start_btn = ctk.CTkButton(ctrl, text="▶  Start", font=F_BTN,
+        self.start_btn = ctk.CTkButton(top, text="▶  Start", font=F_BTN,
                                         width=120, height=36, corner_radius=10,
                                         fg_color=EMERALD_DIM, hover_color=EMERALD,
                                         text_color=WHITE, command=self._toggle)
-        self.start_btn.pack(side="left")
+        self.start_btn.pack(side="right", padx=20)
+
+        # ── INSTRUMENT SELECTOR ROW ──
+        instr_row = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=40,
+                                  border_width=0)
+        instr_row.pack(fill="x"); instr_row.pack_propagate(False)
+
+        ctk.CTkLabel(instr_row, text="  Instruments:", font=F_SMALL,
+                     text_color=GREY).pack(side="left", padx=(14,8), pady=6)
+        self.idx_vars = {}
+        for name in ["NIFTY","BANKNIFTY","CRUDEOIL","NATURALGAS","GOLDTEN","SILVERMIC"]:
+            var = ctk.BooleanVar(value=False)
+            cb = ctk.CTkCheckBox(instr_row, text=name, variable=var, font=F_SMALL,
+                                 fg_color=TEAL_DIM, hover_color=TEAL,
+                                 border_color=BORDER, text_color=WHITE,
+                                 checkbox_width=18, checkbox_height=18, corner_radius=4)
+            cb.pack(side="left", padx=(0,10), pady=6)
+            self.idx_vars[name] = var
+        self.idx_vars["NIFTY"].set(True)  # default
 
         # ── SETTINGS PANEL ──
         settings = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=12,
@@ -857,6 +1068,11 @@ class StrategyTab(ctk.CTkFrame):
         self._param_field(sparams, "Qty Multiplier", self.qty_var,
                           ["1", "2", "3", "5", "10"], 4)
 
+        # SMA Smoothing Length (applied on top of EMA)
+        self.smooth_var = ctk.StringVar(value="9")
+        self._param_field(sparams, "EMA Smooth", self.smooth_var,
+                          ["1", "5", "9", "14", "21"], 5)
+
         # ── SCROLLABLE BODY ──
         body = ctk.CTkScrollableFrame(self, fg_color=BG_DEEP)
         body.pack(fill="both", expand=True, padx=12, pady=(8, 0))
@@ -872,9 +1088,9 @@ class StrategyTab(ctk.CTkFrame):
         self.ws_lbl.pack(side="left", padx=(0,16))
 
         self.spot_lbls = {}
-        for idx in ["NIFTY","BANKNIFTY"]:
-            lbl = ctk.CTkLabel(sr, text=f"{idx}: —", font=F_BODY, text_color=WHITE)
-            lbl.pack(side="left", padx=14)
+        for idx in ["NIFTY","BANKNIFTY","CRUDEOIL","NATURALGAS","GOLDTEN","SILVERMIC"]:
+            lbl = ctk.CTkLabel(sr, text=f"{idx}: —", font=F_MONO_S, text_color=WHITE)
+            lbl.pack(side="left", padx=6)
             self.spot_lbls[idx] = lbl
 
         self.pkt_lbl = ctk.CTkLabel(sr, text="", font=F_SMALL, text_color=GREY_DK)
@@ -951,8 +1167,10 @@ class StrategyTab(ctk.CTkFrame):
         if not HEADERS:
             self._log("❌ Authenticate first (Credentials tab)")
             return
-        choice = self.idx_var.get()
-        indices = ["NIFTY","BANKNIFTY"] if choice=="BOTH" else [choice]
+        indices = [name for name, var in self.idx_vars.items() if var.get()]
+        if not indices:
+            self._log("❌ Select at least one instrument")
+            return
 
         # Read params from GUI
         params = {
@@ -961,6 +1179,7 @@ class StrategyTab(ctk.CTkFrame):
             "target_points": float(self.tgt_var.get()),
             "itm_offset":    int(self.itm_var.get()),
             "qty_mult":      int(self.qty_var.get()),
+            "smooth_len":    int(self.smooth_var.get()),
         }
 
         self.engine = StrategyEngine(indices, self.log_q, params=params)
@@ -994,11 +1213,11 @@ class StrategyTab(ctk.CTkFrame):
         else:
             self.ws_dot.configure(text_color=RED); self.ws_lbl.configure(text="Offline", text_color=RED)
 
-        # Spots
-        for idx in ["NIFTY","BANKNIFTY"]:
-            s=d["spots"].get(idx); exp=d["expiries"].get(idx,""); lot=d["lots"].get(idx,"")
-            if s: self.spot_lbls[idx].configure(text=f"{idx}  {s:.2f}   Exp:{exp}  Lot:{lot}")
-            else: self.spot_lbls[idx].configure(text=f"{idx}: —")
+        # Spots — only show instruments that have data
+        for idx in ["NIFTY","BANKNIFTY","CRUDEOIL","NATURALGAS","GOLDTEN","SILVERMIC"]:
+            s=d["spots"].get(idx)
+            if s: self.spot_lbls[idx].configure(text=f"{idx} {s:.2f}")
+            else: self.spot_lbls[idx].configure(text="")
 
         self.pkt_lbl.configure(text=f"Pkts: {d['packets']:,}")
 
