@@ -261,37 +261,64 @@ def api_post(endpoint, payload, retries=2):
 
 
 # ── MCX Near-Month Futures Resolver ──
+_scrip_master_cache = None
+
+def _load_scrip_master():
+    """Download and cache the Dhan scrip master as a pandas DataFrame."""
+    global _scrip_master_cache
+    if _scrip_master_cache is not None:
+        return _scrip_master_cache
+    from io import StringIO
+    r = requests.get(SCRIP_MASTER_URL, timeout=60)
+    r.raise_for_status()
+    cols = ["SEM_EXM_EXCH_ID", "SEM_SEGMENT", "SEM_SMST_SECURITY_ID",
+            "SEM_INSTRUMENT_NAME", "SM_SYMBOL_NAME", "SEM_EXPIRY_DATE",
+            "SEM_LOT_UNITS", "SEM_TRADING_SYMBOL"]
+    df = pd.read_csv(StringIO(r.text), usecols=cols, low_memory=False)
+    for c in ["SEM_EXM_EXCH_ID", "SEM_SEGMENT", "SEM_INSTRUMENT_NAME", "SM_SYMBOL_NAME"]:
+        df[c] = df[c].astype(str).str.strip()
+    df["SEM_SMST_SECURITY_ID"] = df["SEM_SMST_SECURITY_ID"].astype(str).str.strip()
+    df["SEM_EXPIRY_DATE"] = df["SEM_EXPIRY_DATE"].astype(str).str.strip()
+    _scrip_master_cache = df
+    return df
+
+
 def resolve_mcx_near_month(symbol_name):
-    """Download Dhan scrip master and find the near-month FUTCOM security_id
-       for a given MCX symbol (e.g. CRUDEOIL, NATURALGAS).
+    """Find the near-month FUTCOM security_id for a given MCX symbol.
        Returns (security_id_str, expiry_date_str) or (None, None)."""
     try:
-        r = requests.get(SCRIP_MASTER_URL, timeout=40)
-        r.raise_for_status()
-        lines = r.text.splitlines()
-        header = [h.strip() for h in lines[0].split(",")]
-        idx_map = {h: i for i, h in enumerate(header)}
-
+        df = _load_scrip_master()
         today_str = now_ist().strftime("%Y-%m-%d")
-        candidates = []
-        for line in lines[1:]:
-            parts = line.split(",")
-            if len(parts) < len(header): continue
-            seg  = parts[idx_map.get("SEM_SEGMENT", -1)].strip()
-            inst = parts[idx_map.get("SEM_INSTRUMENT_NAME", -1)].strip()
-            sname = parts[idx_map.get("SM_SYMBOL_NAME", -1)].strip().upper()
-            if seg == "MCX_COMM" and inst == "FUTCOM" and sname == symbol_name.upper():
-                sid = parts[idx_map.get("SEM_SMST_SECURITY_ID", -1)].strip()
-                exp = parts[idx_map.get("SEM_EXPIRY_DATE", -1)].strip()[:10]
-                if exp >= today_str:
-                    candidates.append((exp, sid))
 
-        candidates.sort()
-        if candidates:
-            return candidates[0][1], candidates[0][0]
-    except Exception:
-        pass
-    return None, None
+        # Filter: MCX exchange, FUTCOM instrument, matching symbol
+        mask = ((df["SEM_EXM_EXCH_ID"] == "MCX") &
+                (df["SEM_INSTRUMENT_NAME"] == "FUTCOM") &
+                (df["SM_SYMBOL_NAME"].str.upper() == symbol_name.upper()))
+        matches = df[mask].copy()
+
+        if matches.empty:
+            # Debug: show what MCX FUTCOM symbols exist
+            mcx_fut = df[(df["SEM_EXM_EXCH_ID"] == "MCX") &
+                         (df["SEM_INSTRUMENT_NAME"] == "FUTCOM")]
+            syms = sorted(mcx_fut["SM_SYMBOL_NAME"].str.upper().unique().tolist())
+            print(f"  [DEBUG] MCX FUTCOM symbols in master: {syms}")
+            return None, None
+
+        # Extract expiry date (first 10 chars: YYYY-MM-DD)
+        matches["exp_date"] = matches["SEM_EXPIRY_DATE"].str[:10]
+        # Keep only future expiries
+        matches = matches[matches["exp_date"] >= today_str]
+        if matches.empty:
+            return None, None
+
+        # Pick nearest expiry
+        matches = matches.sort_values("exp_date")
+        row = matches.iloc[0]
+        return str(row["SEM_SMST_SECURITY_ID"]), str(row["exp_date"])
+    except Exception as e:
+        print(f"  [ERROR] resolve_mcx_near_month({symbol_name}): {e}")
+        import traceback; traceback.print_exc()
+        return None, None
 
 
 def ensure_mcx_security_ids():
