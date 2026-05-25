@@ -93,19 +93,21 @@ INDEX_CONFIG = {
     # ── NSE Index Options (CE/PE on ITM strike) ──
     "NIFTY":      {"security_id": "13",  "strike_gap": NIFTY_STRIKE_GAP,     "lot_size": 65,
                    "underlying_seg": "IDX_I",    "opt_instrument": "OPTIDX",
-                   "opt_exchange": "NSE_FNO",    "mode": "options"},
+                   "opt_exchange": "NSE_FNO",    "mode": "options",
+                   "default_itm": 100},
     "BANKNIFTY":  {"security_id": "25",  "strike_gap": BANKNIFTY_STRIKE_GAP, "lot_size": 30,
                    "underlying_seg": "IDX_I",    "opt_instrument": "OPTIDX",
-                   "opt_exchange": "NSE_FNO",    "mode": "options"},
+                   "opt_exchange": "NSE_FNO",    "mode": "options",
+                   "default_itm": 100},
     # ── MCX Commodity Options (CE/PE on ITM strike of futures) ──
     "CRUDEOIL":   {"security_id": None,  "strike_gap": 50,  "lot_size": 100,
                    "underlying_seg": "MCX_COMM", "opt_instrument": "OPTFUT",
                    "opt_exchange": "MCX_COMM",   "mode": "options",
-                   "mcx_symbol": "CRUDEOIL"},
+                   "mcx_symbol": "CRUDEOIL",     "default_itm": 100},
     "NATURALGAS": {"security_id": None,  "strike_gap": 2,   "lot_size": 1250,
                    "underlying_seg": "MCX_COMM", "opt_instrument": "OPTFUT",
                    "opt_exchange": "MCX_COMM",   "mode": "options",
-                   "mcx_symbol": "NATURALGAS"},
+                   "mcx_symbol": "NATURALGAS",   "default_itm": 4},
     # ── MCX Futures (trade the futures contract directly) ──
     "GOLDTEN":    {"security_id": None,  "lot_size": 10,
                    "exchange": "MCX_COMM", "instrument": "FUTCOM",
@@ -670,7 +672,11 @@ class StrategyEngine:
         if not oc: self.log(f"[{idx}] ❌ Option chain failed"); return
         spot = oc["spot_price"]; self.spot_price[idx] = spot
         self.log(f"[{idx}] Spot: {spot:.2f}")
-        ce, pe = select_itm_strikes(idx, spot, oc, itm_offset=self.itm_offset)
+        # Use per-instrument default ITM if available, otherwise global
+        cfg = INDEX_CONFIG[idx]
+        itm = cfg.get("default_itm", self.itm_offset)
+        ce, pe = select_itm_strikes(idx, spot, oc, itm_offset=itm)
+        self.log(f"[{idx}] Using ITM offset: {itm}")
         self.ce_info[idx]=ce; self.pe_info[idx]=pe
         if ce:
             self.log(f"[{idx}] CE: {int(ce['strike'])} | secId={ce['security_id']} | LTP={ce['last_price']:.2f}")
